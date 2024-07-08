@@ -1,9 +1,10 @@
-const express = require('express')
+const express = require('express');
 const app = express();
 require('dotenv').config();
 const port = process.env.PORT || 5000;
 const cors = require('cors');
-const stripe = require("stripe")(process.env.VITE_PAYMENT)
+const jwt = require('jsonwebtoken');
+const stripe = require("stripe")(process.env.VITE_PAYMENT);
 
 app.use(express.json());
 app.use(cors())
@@ -34,6 +35,71 @@ async function run() {
         const paidUserData = database.collection("paidUserData");
         const votedData = database.collection("votedData");
         const commentCollection = database.collection("commentsData")
+
+
+        // verify token middleware 
+        const verifyToken = (req, res, next) => {
+            if (!req.headers.authorization) {
+                return res.status(401).send({ message: "Access Denied" });
+            }
+            const token = req.headers.authorization.split(" ")[1];
+            console.log(token);
+            jwt.verify(token, process.env.ACCESS_TOKEN, (err, decoded) => {
+                if (err) {
+                    res.status(401).send({ message: "Access not granted" })
+                }
+                console.log(decoded, 'line 50');
+                req.decode = decoded;
+                next();
+            })
+        }
+
+        const verifySuperAdmin = async (req, res, next) => {
+            try {
+                const email = req.decode?.email;
+                console.log("Decoded email from token:", email); // Check the email being verified
+                if (!email) {
+                    console.log("Email not found in decoded token");
+                    return res.status(401).send({ message: "Invalid token, no email" });
+                }
+
+                // Check if the email matches the Super Admin email
+                if (email !== process.env.SUPER_ADMIN_EMAIL) {
+                    console.log("User is not a Super Admin");
+                    return res.status(403).send({ message: "Forbidden access" });
+                }
+
+                console.log("User is Super Admin");
+                next();
+            } catch (error) {
+                console.error("Error in verifySuperAdmin middleware:", error);
+                if (!res.headersSent) {
+                    return res.status(500).send({ message: "Internal Server Error" });
+                }
+            }
+        }
+
+        const verifyAdmin = async (req, res, next) => {
+            const email = req.decoded.email;
+            // console.log(email, 'line 96');
+            const query = { email: email };
+            const user = await userCollection.findOne(query);
+            const isAdmin = user?.role === "Admin";
+            if (!isAdmin) {
+                return res.status(401).send({ message: "forbidden access" })
+            }
+            next()
+        }
+
+        // jwt related api 
+        app.post('/jwt', async (req, res) => {
+            const user = req.body;
+            // console.log(user, 'line 97');
+            const token = jwt.sign(user, process.env.ACCESS_TOKEN, {
+                expiresIn: '1h'
+            })
+            res.send({ token })
+        })
 
         app.get('/survey', async (req, res) => {
             const data = await surveyCollection.find().toArray();
@@ -73,43 +139,27 @@ async function run() {
             const start_time = timestamp.toLocaleTimeString('en-BD', zone);
             const surveyStartDate = { start_date, start_time }
             const fina = { ...body, surveyStartDate };
-            // console.log("getting the body", fina);
             const result = await surveyCollection.insertOne(fina);
             res.send(result);
-            // } catch (error) {
-            //     console.error(error);
-            //     res.status(500).json({ error: 'Internal Server Error' });
-            // }
+
         });
         app.patch("/survey/:id", async (req, res) => {
             const id = req.params.id;
-            // console.log(id);
             const query = { _id: new ObjectId(id) };
-            // console.log(query);
-            // if (survey.voted_users && survey.voted_users.includes(userEmail)) {
-            //     return res.status(400).send({ message: "User has already voted" });
-            // }
-
             const filter = await surveyCollection.findOne(query);
-            console.log(filter);
             const totalVotes = filter.total_votes || 0;
-            console.log(totalVotes);
             const updateVotes = totalVotes + 1;
             const updateDoc = {
                 $set: {
                     total_votes: updateVotes
                 }
-                // $push: { voted_users: userEmail }
             }
             const updatedData = await surveyCollection.updateOne(filter, updateDoc);
-            console.log(updatedData);
             res.send(updatedData)
         })
         // PAYMENT APIS 
         app.post("/create_payment_intent", async (req, res) => {
             const { price } = req.body;
-            console.log(req.body)
-
             const amount = parseInt(price * 100);
             const paymentIntent = await stripe.paymentIntents.create({
                 amount: amount,
@@ -120,37 +170,47 @@ async function run() {
                 clientSecret: paymentIntent.client_secret
             })
         })
-        app.post("/paid_user_data", async (req, res) => {
+        app.delete('/userData/:id', async (req, res) => {
+            const id = req.params.id;
+            // console.log(id, 'line 217');
+            const query = { _id: new ObjectId(id) };
+            const filter = await userData.deleteOne(query);
+            res.status(200).send(filter)
+        })
+
+        app.post("/paid_user_data", verifyToken, async (req, res) => {
             const checkData = req.body;
             const email = checkData.email;
-            // console.log(checkData);
 
-            // Insert new paid user data
-            const insertData = await paidUserData.insertOne(checkData);
+            try {
+                // Insert paid user data
+                const insertData = await paidUserData.insertOne(checkData);
 
-            if (insertData.acknowledged) {
+                if (!insertData.acknowledged) {
+                    return res.status(500).send({ message: "Failed to insert paid user data" });
+                }
                 // Find the user in userData collection
                 const previousUser = await userData.findOne({ email: email });
 
-                if (previousUser) {
-                    // Update user data with role "pro_user"
-                    const updateInfo = {
-                        $set: {
-                            role: "pro_user"
-                        }
-                    };
-                    const result = await userData.updateOne({ email: email }, updateInfo);
-
-                    if (result.modifiedCount > 0) {
-                        res.send({ message: "User upgraded to pro user" });
-                    } else {
-                        res.status(500).send({ message: "Failed to update user role" });
-                    }
-                } else {
-                    res.status(404).send({ message: "User not found in userData" });
+                if (!previousUser) {
+                    return res.status(404).send({ message: "User not found in userData" });
                 }
-            } else {
-                res.status(500).send({ message: "Failed to insert paid user data" });
+
+                // Update user data with role "pro_user"
+                const updateInfo = { $set: { role: "pro_user" } };
+                const result = await userData.updateOne({ email: email }, updateInfo);
+
+                if (result.modifiedCount > 0) {
+                    return res.status(200).send({ message: "User upgraded to pro user" });
+                } else {
+                    return res.status(500).send({ message: "Failed to update user role" });
+                }
+            } catch (error) {
+                console.error("Error in /paid_user_data endpoint:", error);
+                // Ensure we only send a single response
+                if (!res.headersSent) {
+                    return res.status(500).send({ message: "Internal Server Error" });
+                }
             }
         });
 
@@ -159,15 +219,78 @@ async function run() {
             const query = { email: email };
             const filter = await paidUserData.findOne(query);
             res.send(filter)
-            // const filter = await 
+        })
+
+        // testing api for posting user info 
+
+        app.get('/super-admin/:email', async (req, res) => {
+            const email = req.params.email;
+            let superAdmin = false
+            if (email === process.env.SUPER_ADMIN_EMAIL) {
+                superAdmin = true
+            }
+            else {
+                // console.log('not matched');
+                superAdmin = false
+            }
+            res.status(200).send(superAdmin)
+        });
+        app.get("/admin/:email", async (req, res) => {
+            const email = req.params.email;
+            // console.log(email, "line 303");
+            let admin = false
+            const query = { email: email };
+            const result = await userData.findOne(query);
+            // console.log(result, "line 307");
+            if (result?.role === "Admin") {
+                admin = true
+            }
+            else {
+                admin = false
+            }
+            res.send(admin)
+        })
+
+        app.patch("/user/admin/:email", verifyToken, verifySuperAdmin, async (req, res) => {
+            const email = req.params.email;
+            // console.log(email, 'line 305');
+            try {
+                const query = { email: email };
+                const getUser = await userData.findOne(query);
+                if (!getUser) {
+                    return res.status(404).send({ message: "User not found" });
+                }
+                const updateDoc = {
+                    $set: {
+                        role: "Admin"
+                    }
+                };
+                const result = await userData.updateOne({ email: email }, updateDoc);
+                res.status(200).send(result);
+            } catch (error) {
+                console.error("Error updating user role:", error);
+                res.status(500).send({ message: "Internal Server Error" });
+            }
+        });
+        app.get("/user/admin", async (req, res) => {
+            const role = 'Admin';
+            const query = { role: role };
+            const findAdmin = await userData.find(query).toArray();
+            res.status(200).send(findAdmin)
         })
 
 
-        // testing api for posting user info 
         app.post("/userData", async (req, res) => {
             const body = req.body;
-            const result = await userData.insertOne(body);
-            res.send(result)
+            const checkEmail = { email: body.email }
+            const check = await userData.findOne(checkEmail);
+            if (!check) {
+                const result = await userData.insertOne(body);
+                res.send(result)
+            }
+            else {
+                res.status(200).send({ message: "user already exist" })
+            }
         });
         app.get("/userData", async (req, res) => {
             const email = await userData.find().toArray();
@@ -175,7 +298,6 @@ async function run() {
         })
         app.post("/votedSurveyData", async (req, res) => {
             const data = req.body;
-            console.log(data, "line 177");
             const result = await votedData.insertOne(data);
             res.status(200).send(result)
         })
@@ -183,10 +305,9 @@ async function run() {
             const allData = await votedData.find().toArray();
             res.status(200).send(allData)
         })
-        app.post("/comments", async (req, res) => {
+        app.post("/comments", verifyToken, async (req, res) => {
             const commentBody = req.body;
             commentBody.timestamp = new Date().toISOString()
-            console.log(commentBody);
             const response = await commentCollection.insertOne(commentBody);
             res.status(200).send(response)
         })
@@ -200,6 +321,65 @@ async function run() {
             const query = await commentCollection.find(id).toArray();
             res.send(query)
         })
+        app.patch("/comment/:id", async (req, res) => {
+            const commentId = req.params.id;
+            const newComment = req.body.comment;
+            const query = { _id: new ObjectId(commentId) };
+            const filter = await commentCollection.findOne(query);
+            console.log(filter, 'line 328');
+            const updateDoc = {
+                $set: {
+                    comment: newComment
+                }
+            }
+            const result = await commentCollection.updateOne(updateDoc, filter);
+            console.log(result, 'line 336');
+            // res.status(200).send(result)
+
+        })
+        app.delete("/comment/:id", async (req, res) => {
+            const commentId = req.params.id;
+            // console.log(commentId);
+            const query = { _id: new ObjectId(commentId) }
+            const filter = await commentCollection.deleteOne(query);
+            res.status(200).send({ message: "Deleted successfully" })
+        })
+
+        app.get('/vote-stats', verifyToken, async (req, res) => {
+            try {
+                const voteStats = await votedData.aggregate([
+                    {
+                        $lookup: {
+                            from: 'surveyData',
+                            localField: 'surveyId',
+                            foreignField: '_id',
+                            as: 'surveyInfo'
+                        }
+                    },
+                    {
+                        $unwind: '$surveyInfo'
+                    },
+                    {
+                        $group: {
+                            _id: '$surveyInfo.category',
+                            votes: { $sum: 1 }
+                        }
+                    },
+                    {
+                        $project: {
+                            _id: 0,
+                            category: '$_id',
+                            votes: '$votes'
+                        }
+                    }
+                ]).toArray();
+                res.send(voteStats);
+            } catch (error) {
+                console.error("Error fetching vote stats:", error);
+                res.status(500).send({ message: "Internal Server Error" });
+            }
+        });
+
 
 
 
