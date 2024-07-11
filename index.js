@@ -323,18 +323,23 @@ async function run() {
         })
         app.patch("/comment/:id", async (req, res) => {
             const commentId = req.params.id;
+            console.log(commentId, 'line 326');
             const newComment = req.body.comment;
+            console.log(newComment, 'line 327');
             const query = { _id: new ObjectId(commentId) };
-            const filter = await commentCollection.findOne(query);
-            console.log(filter, 'line 328');
+            const newTimeStamp = newComment.timestamp = new Date().toISOString()
+
+            // const filter = await commentCollection.findOne(query);
+            // console.log(filter, 'line 328');
             const updateDoc = {
                 $set: {
-                    comment: newComment
+                    comment: newComment,
+                    timestamp: newTimeStamp
                 }
             }
-            const result = await commentCollection.updateOne(updateDoc, filter);
+            const result = await commentCollection.updateOne(query, updateDoc);
             console.log(result, 'line 336');
-            // res.status(200).send(result)
+            res.status(200).send(result)
 
         })
         app.delete("/comment/:id", async (req, res) => {
